@@ -1,7 +1,7 @@
 # AI usage
 
 The assessment allows AI tools as long as their use is stated. I used an AI
-assistant (Claude, by Anthropic) as a pair: it did a large share of the
+assistant as a pair: it did a large share of the
 implementation and drafting; I set the direction, ran and verified the
 project, and own every decision in this submission.
 
