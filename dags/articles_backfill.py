@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pendulum
-from airflow.sdk import Param, dag, get_current_context, task
+from airflow.sdk import Param, TriggerRule, dag, get_current_context, task
 from airflow.sdk.exceptions import AirflowFailException
 
 from pipeline.alerts import on_task_failure
@@ -72,8 +72,9 @@ def articles_backfill():
     def load_month(month: str) -> dict:
         return backfill_month(Settings.from_env(), month)
 
-    @task
-    def validate(_: list) -> dict:
+    # none_failed: still validate when every month was already done and load_month is skipped.
+    @task(trigger_rule=TriggerRule.NONE_FAILED)
+    def validate(_: list | None = None) -> dict:
         result = validate_backfill(Settings.from_env())
         if result["months_mismatched"]:
             # Not fatal: hard deletes that happened after T0 show up here until
