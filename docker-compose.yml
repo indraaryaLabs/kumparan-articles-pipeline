@@ -1,0 +1,171 @@
+# Local stack: source DB, warehouse DB, and Airflow 3 (LocalExecutor).
+# Based on the official Airflow 3.3.2 docker-compose, trimmed: no Celery/Redis
+# (LocalExecutor is enough on one machine) and no triggerer (no deferrable tasks).
+#
+#   docker compose up -d --build      # Airflow UI on http://localhost:8080 (airflow / airflow)
+#
+# Passwords below are for a local demo only. In production they come from a
+# secrets backend, and the warehouse writer would not be a superuser.
+
+x-airflow-common: &airflow-common
+  build: .
+  image: kumparan-articles-airflow:3.3.2
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-local_dev_jwt_secret_change_me}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    PYTHONPATH: /opt/airflow
+    # Pipeline settings (read by pipeline/config.py)
+    SOURCE_DSN: postgresql://etl_reader:etl_reader@source-db:5432/kumparan
+    WAREHOUSE_DSN: postgresql://postgres:postgres@warehouse-db:5432/warehouse
+    DATA_DIR: /opt/airflow/data
+    LOOKBACK_MINUTES: ${LOOKBACK_MINUTES:-15}
+    SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    # Used by `make seed` / `make simulate` / `make test` inside the container
+    SOURCE_ADMIN_DSN: postgresql://postgres:postgres@source-db:5432/kumparan
+    TEST_SOURCE_ADMIN_DSN: postgresql://postgres:postgres@source-db:5432/kumparan_test
+    TEST_SOURCE_DSN: postgresql://etl_reader:etl_reader@source-db:5432/kumparan_test
+    TEST_WAREHOUSE_DSN: postgresql://postgres:postgres@warehouse-db:5432/warehouse_test
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./pipeline:/opt/airflow/pipeline
+    - ./source_db:/opt/airflow/source_db
+    - ./tests:/opt/airflow/tests
+    - ./data:/opt/airflow/data
+    - ./logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    airflow-db:
+      condition: service_healthy
+    source-db:
+      condition: service_healthy
+    warehouse-db:
+      condition: service_healthy
+
+services:
+  source-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: kumparan
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./source_db/create_test_db.sql:/docker-entrypoint-initdb.d/00_create_test_db.sql:ro
+      - ./source_db/init.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - source-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "kumparan"]
+      interval: 5s
+      retries: 10
+    restart: always
+
+  warehouse-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: warehouse
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./warehouse_db/create_test_db.sql:/docker-entrypoint-initdb.d/00_create_test_db.sql:ro
+      - ./warehouse_db/init.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - warehouse-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "warehouse"]
+      interval: 5s
+      retries: 10
+    restart: always
+
+  airflow-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 10
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/data
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs /opt/airflow/data
+        /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    user: "0:0"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  source-db-volume:
+  warehouse-db-volume:
+  airflow-db-volume:

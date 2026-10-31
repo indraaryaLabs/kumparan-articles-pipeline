@@ -1,0 +1,4 @@
+# Versions match the Airflow 3.3.2 constraints file, so they never fight Airflow's own pins.
+psycopg[binary]==3.3.5
+pyarrow==25.0.1
+pytest==9.2.0
